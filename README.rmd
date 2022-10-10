@@ -1,0 +1,307 @@
+---
+output:
+  md_document:
+    variant: markdown_github
+---
+
+# Purpose
+
+This README is for my Statistical Learning Theory Assignement. I am planning on analysing some form of time series data using RNNs, SVR and GBM. The data will be split into training, validation and test data. The models will be tuned using simple grid-search hyperparameter tuning with the validation performance determining the best model for each class. The best models will be retrained on the training and validation sets combined before performance on the test set is used to determine the best class of model for the problem.
+
+
+```{r}
+
+rm(list = ls()) # Clean your environment:
+gc() # garbage collection - It can be useful to call gc after a large object has been removed, as this may prompt R to return memory to the operating system.
+library(tidyverse)
+pacman::p_load(cowplot, ggplot2, kableExtra, rsample, glue, lubridate)
+list.files('code/', full.names = T, recursive = T) %>% .[grepl('.R', .)] %>% as.list() %>% walk(~source(.))
+```
+
+
+# Data
+
+```{r data}
+
+data <- read.csv("data/household_power_consumption.csv", header = TRUE, sep = ';')
+
+data_power <- data %>% as_tibble() %>% 
+    mutate(date = as.character(as.Date(Date, tryFormats =c("%d/%m/%Y")))) %>% 
+    mutate(date = paste(date, Time)) %>% 
+    mutate(date_time = as_datetime(date)) %>% 
+    rename(power = Global_active_power) %>% 
+    select(date_time, power) %>% 
+    mutate(power = as.numeric(power))
+    
+
+data_power <- data_power %>% mutate(date_time = floor_date(date_time, unit="hour")) %>% 
+    group_by(date_time) %>% 
+    summarise(power = mean(power, na.rm=TRUE))
+
+data_power %>%# filter(date_time > as.Date("2010-10-01")) %>% 
+ggplot() + 
+    geom_line(aes(x = date_time, y = power))
+
+
+```
+
+
+
+# LSTM Model
+```{r lstm}
+
+pacman::p_load(reticulate)
+
+reticulate::use_virtualenv("/Users/jonathanrossouw/Desktop/Masters/Dat Sci/ML/Project/.venv", require = TRUE)
+reticulate::py_config()
+# Install Tensorflow and Keras in virtual environment
+### virtualenv_install(".venv/", "tensorflow")
+### install_tensorflow()
+### install_keras()
+# Load Tensorflow and Keras
+library(tensorflow)
+library(keras)
+
+```
+
+```{r lstm-data-plot, fig.cap = "LSTM data with min-max rescaled cases"}
+### Wrangle and Plot LSTM Data
+# Wrangle data
+   
+data_lstm <- data_wrangling_func(data = data_power %>% rename(Date = date_time),
+                                   type = "lstm", 
+                                   final_date = "2009-01-01")
+  data_lstm_val <- data_wrangling_func(data = data_power %>% rename(Date = date_time) %>% filter(Date >= as.Date("2009-01-01")), 
+                                   type = "lstm", 
+                                   final_date = "2010-01-01")
+# Set min and max for later transformations
+  min_max <- data_lstm$min_max
+  data_lstm_train <- data_lstm$data
+  
+  val_min_max <- data_lstm_val$min_max
+  data_lstm_val <- data_lstm_val$data
+# Plot Rescaled LSTM data 
+ data_lstm_train %>% 
+    ggplot() + 
+    theme_bw() +
+    geom_line(aes(x = Date, y = power), colour = "deepskyblue4", alpha = 0.8) + 
+    labs(title = "JSE All Share Vol 1 January 2009 - 30 December 2017", 
+         subtitle =  "Rescaled (Min Max)",
+         y = "min max scaled cases")
+ 
+```
+
+```{r create-arrays}
+### Create LSTM Data Arrays
+data_array <- data_array_func(data = data_lstm_train, 
+                              val = data_lstm_val,
+                              initial = 2*24, assess = 12, skip = 11)
+
+```
+
+```{r hyperparameter-grid}
+##### Set hyperparameter grid
+lstm_hyp <- expand.grid(loss = c("mse"),
+                                   optimizer = c("adam"),
+                                   epochs = 2) %>%
+  split(., seq(nrow(.)))
+
+```
+
+```{r Hyperparameter-Tune-Uni-LSTM}
+### Hyperparameter tuning for univariate LSTM model
+# If cache == FALSE then perform hyperparameter tuning
+#if(cache != TRUE){
+  # Perform hyperparameter tuning
+  hyp_res <- hyp_tune_func(data_train = data_array, 
+                         data_predict = data_array$x_val_array, 
+                         data_actual = data_array$y_val_array[,,1], 
+                         hyperparams = hyperparameter_grid,
+                         min_max = val_min_max)
+  # Collect results of hyperparameter tuning
+  tuning_res <- hyp_res %>% 
+   do.call("rbind", .)
+#  }
+# If cache == TRUE, read in hyperparameter tuning results from 
+# Google Cloud Compute
+if(cache){tuning_res <- read.csv("cache/tuning_res.csv")}
+# Determine best model as model with lowest MSE on validation set
+best_tune <- tuning_res %>%  
+  filter(mse == min(mse))
+# Print Best Univariate LSTM models
+kable(tuning_res %>% arrange(mse) %>% head(), digits = 2, 
+      format = "latex", caption = "Top 5 univariate LSTM models with lowest MSE") %>%
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+```{r best-LSTM-uni-LSTM-plot, fig.cap = "Best performing univariate LSTM model predictions"}
+#### Fit the best univariate LSTM according to the results of 
+# the hyperparameter tuning
+lstm_model <- lstm_fit_func(data_train = data_array,
+                            data_predict = data_array$x_val_array,
+                            epochs = best_tune$epochs, 
+                            optimizer = best_tune$optimizer, 
+                            loss = best_tune$loss)
+# Determine performance
+
+data_val <- data_power %>% rename(Date = date_time) %>% filter(Date >= as.Date("2009-01-01") & Date < as.Date("2010-01-01")) %>% tail(-48)
+
+lstm_performance <- lstm_perform_func(data_actual = data_val, lstm_model, val_min_max, 
+                                      title = "Comparison: Power Usage vs Prediction from Univariate LSTM")
+
+# Plot predicted and actual cases for validation set
+lstm_performance$`LSTM Plot`
+
+
+lstm_fit <- hyp_tune_func(data_lists = data_array, 
+                          data_actual = data_val,
+                          hyperparams = lstm_hyp, 
+                          fit_func = lstm_fit_func, 
+                          min_max = val_min_max)
+
+```
+
+
+
+
+
+
+
+
+
+# SVR
+
+```{r SVR}
+library(liquidSVM)
+
+data_SVR_train <- data_wrangling_func(data = data_power %>% rename(Date = date_time),
+                                      type = "SVR", 
+                                      final_date = "2009-01-01")
+
+data_SVR_val <- data_wrangling_func(data = data_power %>% rename(Date = date_time) %>% filter(Date >= as.Date("2009-01-01")),
+                                      type = "SVR", 
+                                      final_date = "2010-01-01")
+
+data_SVR_array <- data_array_func(data = data_SVR_train, 
+                                  val = data_SVR_val, 
+                                  initial = 2*24,
+                                  assess = 12, 
+                                  skip = 11)
+
+data_SVR_lists <- data_SVR_GBM_wrangle(data_SVR_array, type = "SVR")
+
+```
+
+```{r SVR_tune}
+
+# SVR hyperparameters
+
+svr_hyp <- expand.grid(gamma = c(0.2),
+                       lambda = c(2)) %>%
+  split(., seq(nrow(.)))
+
+# Tune SVR regressions
+
+SVR_fit <- svmRegression(x = data_SVR_lists$train_list$`1`[,-1], 
+              y = data_SVR_lists$train_list$`1`[,"Y"])
+
+SVR_pred <- predict(SVR_fit, data_SVR_lists$val_list$`1`[,-1])
+
+
+
+svr_hyp_res <- hyp_tune_func(data_list = data_SVR_lists,
+                             data_actual = data_val, 
+                             hyperparams = svr_hyp,
+                             fit_func = svr_fit_func, 
+                             type = "svr")
+
+
+
+
+data_val <- data_power %>% rename(Date = date_time) %>% filter(Date >= as.Date("2009-01-01") & Date < as.Date("2010-01-01")) %>% tail(-48)
+
+data_val %>% mutate(SVR_pred_df) %>% 
+  ggplot() +
+  geom_line(aes(Date, power)) +
+  geom_line(aes(Date, SVR_pred_df), colour = "red", alpha =0.8)
+
+
+
+```
+
+
+# LightGBM
+
+```{r lightGBM}
+
+library(lightgbm)
+
+data_GBM_train <- data_wrangling_func(data = data_power %>% rename(Date = date_time),
+                                      type = "GBM", 
+                                      final_date = "2009-01-01")
+
+data_GBM_val <- data_wrangling_func(data = data_power %>% rename(Date = date_time) %>% filter(Date >= as.Date("2009-01-01")),
+                                      type = "GBM", 
+                                      final_date = "2010-01-01")
+
+data_GBM_array <- data_array_func(data = data_GBM_train, 
+                                  val = data_GBM_val, 
+                                  initial = 2*24,
+                                  assess = 12, 
+                                  skip = 11)
+
+data_GBM_lists <- data_SVR_GBM_wrangle(data_GBM_array, type = "lightgbm")
+
+```
+
+```{r lightGBM_tune}
+
+data_val <- data_power %>% rename(Date = date_time) %>% filter(Date >= as.Date("2009-01-01") & Date < as.Date("2010-01-01")) %>% tail(-48)
+
+lgb_hyp <- expand.grid(boosting = c("dart"),
+                       nrounds = c(50)) %>%
+  split(., seq(nrow(.)))
+
+GBM_hyp_res <- hyp_tune_func(data_list = data_GBM_lists,
+                             data_actual = data_val, 
+                             hyperparams = lgb_hyp,
+                             fit_func = lgb_fit_func, 
+                             type = "lightgbm")
+
+```
+
+```{r GBM_plot}
+
+
+
+
+ ###########   
+
+    GBM_forecast <- data_test %>% mutate(pred = GBM_pred_df) 
+    gbm_plot <- GBM_forecast %>% ggplot() +
+      geom_line(aes(x = Date, y = power), alpha = 0.8) +
+
+      geom_line(aes(x = Date, y = pred), color = "red", size = 1, alpha = 0.8) +
+      labs(title = title, x = "", y = "Power Usage") +
+      theme_minimal_hgrid() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 7),
+            plot.title = ggplot2::element_text(size = 10),
+            axis.title.y = element_text(size = 7))
+    
+    GBM_perf <- GBM_forecast %>% 
+      summarise(mean((pred - power)^2, na.rm = TRUE)) %>% .[[1]]
+        # Store Results
+        res <- hyperparams %>%
+            as_tibble() %>%
+            mutate(mse = GBM_perf)
+###########
+        
+gbm_fit <- GMB_fit_func(data_list = data_GBM_lists, hyperparams = lgb_hyp[[1]])
+
+gbm_fit$plot
+gbm_fit$performance
+
+```
+
+
